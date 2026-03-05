@@ -14,6 +14,7 @@
 #include "graphic_utils.h"
 #include "hand_analysis.h"
 #include "joker.h"
+#include "joker_text.h"
 #include "list.h"
 #include "selection_grid.h"
 #include "soundbank.h"
@@ -400,6 +401,8 @@ static const Rect MULT_TEXT_RECT            = {40,      80,     64,     88  };
 static const Rect BLIND_REWARD_RECT         = {40,      32,     64,     40  };
 static const Rect BLIND_REQ_TEXT_RECT       = {32,      24,     64,     32  };
 static const Rect SHOP_PRICES_TEXT_RECT     = {72,      56,     192,    160 };
+// Shop info panel (name + wrapped description). Keep it below price text (y ~= 111).
+static const Rect SHOP_DESC_TEXT_RECT       = {80,      120,    232,    160 };
 
 static const Rect SINGLE_BLIND_SEL_REQ_SCORE_RECT = {80, 120,    104,     128  };
 
@@ -3886,6 +3889,212 @@ static void game_round_end_dismiss_round_end_panel()
     }
 }
 
+// -------------------------------
+// Shop info panel text utilities
+// -------------------------------
+
+static inline int tte_chars_that_fit(const Rect* r)
+{
+    // Use the same approach as update_text_rect_to_center_str(): integer division by char width.
+    return rect_width(r) / TTE_CHAR_SIZE;
+}
+
+static void tte_print_wrapped(
+    int x,
+    int y,
+    int max_cols,
+    int max_lines,
+    int palette_bank,
+    const char* text
+)
+{
+    if (text == NULL || max_cols <= 0 || max_lines <= 0)
+        return;
+
+    char line[64];
+    int line_len = 0;
+    int lines_printed = 0;
+
+    const char* p = text;
+
+    // Helper to flush current line buffer.
+#define FLUSH_LINE()                                                                           \
+    do                                                                                         \
+    {                                                                                          \
+        if (lines_printed >= max_lines)                                                        \
+            goto done;                                                                         \
+        line[line_len] = '\0';                                                                 \
+        tte_printf(                                                                            \
+            "#{P:%d,%d; cx:0x%X000}%s",                                                       \
+            x,                                                                                 \
+            y + lines_printed * TTE_CHAR_SIZE,                                                 \
+            palette_bank,                                                                      \
+            line                                                                               \
+        );                                                                                     \
+        lines_printed++;                                                                       \
+        line_len = 0;                                                                          \
+    } while (0)
+
+    while (*p != '\0' && lines_printed < max_lines)
+    {
+        // Explicit newline forces a wrap.
+        if (*p == '\n')
+        {
+            FLUSH_LINE();
+            p++;
+            continue;
+        }
+
+        // Skip leading spaces.
+        while (*p == ' ')
+            p++;
+        if (*p == '\0')
+            break;
+
+        // Read next word.
+        const char* w = p;
+        int wlen = 0;
+        while (w[wlen] != '\0' && w[wlen] != ' ' && w[wlen] != '\n')
+            wlen++;
+
+        // If word itself is longer than a line, hard-split it.
+        int consumed = 0;
+        while (consumed < wlen && lines_printed < max_lines)
+        {
+            int seg_len = min(max_cols, wlen - consumed);
+
+            // If we already have content on the line, and it won't fit with a space, flush.
+            if (line_len > 0 && (line_len + 1 + seg_len) > max_cols)
+            {
+                FLUSH_LINE();
+            }
+
+            // Add space if needed.
+            if (line_len > 0)
+                line[line_len++] = ' ';
+
+            for (int i = 0; i < seg_len && line_len < (int)sizeof(line) - 1; i++)
+                line[line_len++] = w[consumed + i];
+
+            consumed += seg_len;
+
+            // If we split a long word, flush immediately so the next segment starts on new line.
+            if (consumed < wlen)
+            {
+                FLUSH_LINE();
+            }
+        }
+
+        p += wlen;
+    }
+
+    if (line_len > 0 && lines_printed < max_lines)
+    {
+        FLUSH_LINE();
+    }
+
+done:
+#undef FLUSH_LINE
+}
+
+static inline void shop_desc_clear(void)
+{
+    tte_erase_rect_wrapper(SHOP_DESC_TEXT_RECT);
+}
+
+static void shop_desc_set(const char* title, const char* body)
+{
+    shop_desc_clear();
+
+    if (title == NULL)
+        title = "";
+    if (body == NULL)
+        body = "";
+
+    // Title (yellow) on first line
+    tte_printf(
+        "#{P:%d,%d; cx:0x%X000}%s",
+        SHOP_DESC_TEXT_RECT.left,
+        SHOP_DESC_TEXT_RECT.top,
+        TTE_YELLOW_PB,
+        title
+    );
+
+    // Body (white), wrapped below
+    Rect body_rect = SHOP_DESC_TEXT_RECT;
+    body_rect.top += TTE_CHAR_SIZE;
+
+    int max_cols = tte_chars_that_fit(&body_rect);
+    int max_lines = rect_height(&body_rect) / TTE_CHAR_SIZE;
+
+    tte_print_wrapped(body_rect.left, body_rect.top, max_cols, max_lines, TTE_WHITE_PB, body);
+}
+
+static void shop_update_description_for_selection(const Selection* selection)
+{
+    if (selection == NULL)
+    {
+        shop_desc_clear();
+        return;
+    }
+
+    switch (selection->y)
+    {
+        // Owned Jokers row
+        case 0: {
+            JokerObject* joker_object =
+                (JokerObject*)list_get_at_idx(&_owned_jokers_list, selection->x);
+            if (joker_object == NULL || joker_object->joker == NULL)
+            {
+                shop_desc_clear();
+                return;
+            }
+
+            shop_desc_set(
+                joker_get_display_name(joker_object->joker->id),
+                joker_get_description(joker_object->joker->id)
+            );
+            return;
+        }
+
+        // Shop row: Next Round button (x=0) + shop Jokers (x>=1)
+        case 1: {
+            if (selection->x == NEXT_ROUND_BTN_SEL_X)
+            {
+                shop_desc_set("NEXT ROUND", "Leave the shop and pick the next blind.");
+                return;
+            }
+
+            int shop_joker_idx = selection->x - 1;
+            JokerObject* joker_object = (JokerObject*)list_get_at_idx(&_shop_jokers_list, shop_joker_idx);
+            if (joker_object == NULL || joker_object->joker == NULL)
+            {
+                shop_desc_clear();
+                return;
+            }
+
+            shop_desc_set(
+                joker_get_display_name(joker_object->joker->id),
+                joker_get_description(joker_object->joker->id)
+            );
+            return;
+        }
+
+        // Reroll row
+        case 2: {
+            static char reroll_desc[64];
+            // Keep this short to fit the 5-line panel.
+            snprintf(reroll_desc, sizeof(reroll_desc), "Pay $%d to refresh shop. Cost +1 each time.", reroll_cost);
+            shop_desc_set("REROLL", reroll_desc);
+            return;
+        }
+
+        default:
+            shop_desc_clear();
+            return;
+    }
+}
+
 static Rect get_text_rect_under_sprite_object(SpriteObject* sprite_object)
 {
     int height = 0;
@@ -4118,6 +4327,11 @@ static bool jokers_sel_row_on_selection_changed(
         );
     }
 
+    if (new_selection->y == row_idx)
+    {
+        shop_update_description_for_selection(new_selection);
+    }
+
     return true;
 }
 
@@ -4287,6 +4501,11 @@ static bool shop_top_row_on_selection_changed(
         }
     }
 
+    if (new_selection->y == row_idx)
+    {
+        shop_update_description_for_selection(new_selection);
+    }
+
     return true;
 }
 
@@ -4310,6 +4529,11 @@ static bool shop_reroll_row_on_selection_changed(
     else if (row_idx == new_selection->y)
     {
         memset16(&pal_bg_mem[REROLL_BTN_SELECTED_BORDER_PID], BTN_HIGHLIGHT_COLOR, 1);
+    }
+
+    if (new_selection->y == row_idx)
+    {
+        shop_update_description_for_selection(new_selection);
     }
 
     return true;
@@ -4359,6 +4583,9 @@ static inline void game_shop_reroll(int* reroll_cost)
         TTE_WHITE_PB,
         *reroll_cost
     );
+
+    // Keep the info panel in sync (cost changes without a selection change).
+    shop_update_description_for_selection(&shop_selection_grid.selection);
 }
 
 static void shop_reroll_row_on_key_transit(SelectionGrid* selection_grid, Selection* selection)
@@ -4385,7 +4612,12 @@ static void game_shop_process_user_input()
         // The selection grid is initialized outside of bounds and moved
         // to trigger the selection change so the initial selection is visible
         shop_selection_grid.selection = SHOP_INIT_SEL;
+        // First land on NEXT ROUND (x=0), then (if available) advance to the first shop Joker.
         selection_grid_move_selection_horz(&shop_selection_grid, 1);
+        if (list_get_len(&_shop_jokers_list) > 0)
+        {
+            selection_grid_move_selection_horz(&shop_selection_grid, 1);
+        }
         tte_printf(
             "#{P:%d,%d; cx:0x%X000}$%d",
             SHOP_REROLL_RECT.left,
@@ -4412,6 +4644,7 @@ static void game_shop_outro()
     if (timer == 1)
     {
         tte_erase_rect_wrapper(SHOP_PRICES_TEXT_RECT); // Erase the shop prices text
+        shop_desc_clear();
 
         ListItr itr = list_itr_create(&_shop_jokers_list);
         JokerObject* joker_object;
@@ -4515,6 +4748,8 @@ static void game_shop_on_exit()
     }
 
     list_clear(&_shop_jokers_list);
+
+    shop_desc_clear();
 
     increment_blind(BLIND_STATE_DEFEATED); // TODO: Move to game_round_end()?
 }
