@@ -25,7 +25,9 @@
 
 #include <maxmod.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define STRAIGHT_AND_FLUSH_SIZE_FOUR_FINGERS 4
 #define STRAIGHT_AND_FLUSH_SIZE_DEFAULT      5
@@ -309,6 +311,146 @@ static bool jokers_sel_row_on_selection_changed(
     const Selection* prev_selection,
     const Selection* new_selection
 );
+
+// --------------------------
+// Shop info panel (text)
+// --------------------------
+
+static void shop_info_clear(void)
+{
+    tte_erase_rect_wrapper(SHOP_INFO_TEXT_RECT);
+}
+
+static void shop_info_print_wrapped(const Rect* rect, int color_pb, const char* text, int max_lines)
+{
+    if (rect == NULL || text == NULL || max_lines <= 0)
+        return;
+
+    int max_chars = rect_width((Rect*)rect) / TTE_CHAR_SIZE;
+    if (max_chars <= 0)
+        return;
+
+    const char* p = text;
+    char line[64];
+
+    int y = rect->top;
+    for (int line_no = 0; line_no < max_lines && *p; line_no++)
+    {
+        // Skip spaces
+        while (*p == ' ')
+            p++;
+
+        if (*p == '\0')
+            break;
+
+        // Explicit newline: produce blank line
+        if (*p == '\n')
+        {
+            p++;
+            y += TTE_CHAR_SIZE;
+            continue;
+        }
+
+        int len = 0;
+        int last_space = -1;
+
+        while (p[len] && p[len] != '\n' and len < max_chars)
+        {
+            if (p[len] == ' ')
+                last_space = len;
+            len++;
+        }
+
+        int advance = len;
+        if (p[len] == '\n')
+        {
+            advance = len + 1;
+        }
+        else if (len == max_chars and last_space > 0)
+        {
+            len = last_space;
+            advance = last_space + 1;
+        }
+
+        if (len >= (int)sizeof(line))
+            len = (int)sizeof(line) - 1;
+
+        memcpy(line, p, (size_t)len);
+        line[len] = '\0';
+        p += advance;
+
+        tte_printf("#{P:%d,%d; cx:0x%X000}%s", rect->left, y, color_pb, line);
+        y += TTE_CHAR_SIZE;
+        if (y > rect->bottom)
+            break;
+    }
+}
+
+static void shop_update_info_panel(const Selection* selection)
+{
+    if (selection == NULL)
+        return;
+
+    shop_info_clear();
+
+    const char* title = "";
+    char body[256];
+    body[0] = '\0';
+
+    if (selection->y == 0)
+    {
+        // Owned Jokers row (sell)
+        JokerObject* joker_object = (JokerObject*)list_get_at_idx(&_owned_jokers_list, selection->x);
+        if (joker_object != NULL)
+        {
+            title = joker_get_name(joker_object->joker->id);
+            const char* desc = joker_get_desc(joker_object->joker->id);
+            int sell_value = joker_get_sell_value(joker_object->joker);
+            snprintf(body, sizeof(body), "%s\nSell: $%d (B)", desc ? desc : "", sell_value);
+        }
+    }
+    else if (selection->y == 1)
+    {
+        // Shop top row (Next Round + Jokers)
+        if (selection->x == NEXT_ROUND_BTN_SEL_X)
+        {
+            title = "Next Round";
+            snprintf(body, sizeof(body), "Proceed to blind select.\n(A)");
+        }
+        else
+        {
+            int idx = selection->x - 1; // -1 for Next Round button
+            JokerObject* joker_object = (JokerObject*)list_get_at_idx(&_shop_jokers_list, idx);
+            if (joker_object != NULL)
+            {
+                title = joker_get_name(joker_object->joker->id);
+                const char* desc = joker_get_desc(joker_object->joker->id);
+                snprintf(body, sizeof(body), "%s\nCost: $%d (A)", desc ? desc : "", joker_object->joker->value);
+            }
+        }
+    }
+    else if (selection->y == 2)
+    {
+        // Reroll row
+        title = "Reroll";
+        snprintf(body, sizeof(body), "Replace shop Jokers.\nCost: $%d (A)\nCost increases.", reroll_cost);
+    }
+
+    // Title line
+    tte_printf(
+        "#{P:%d,%d; cx:0x%X000}%s",
+        SHOP_INFO_TEXT_RECT.left,
+        SHOP_INFO_TEXT_RECT.top,
+        TTE_BLUE_PB,
+        title
+    );
+
+    // Body (wrapped)
+    Rect body_rect = SHOP_INFO_TEXT_RECT;
+    body_rect.top += TTE_CHAR_SIZE + 2;
+    shop_info_print_wrapped(&body_rect, TTE_WHITE_PB, body, 4);
+}
+
 static int jokers_sel_row_get_size(void);
 static void game_shop_create_items(void);
 
@@ -401,8 +543,8 @@ static const Rect MULT_TEXT_RECT            = {40,      80,     64,     88  };
 static const Rect BLIND_REWARD_RECT         = {40,      32,     64,     40  };
 static const Rect BLIND_REQ_TEXT_RECT       = {32,      24,     64,     32  };
 static const Rect SHOP_PRICES_TEXT_RECT     = {72,      56,     192,    160 };
-// Shop info panel (name + wrapped description). Keep it below price text (y ~= 111).
-static const Rect SHOP_DESC_TEXT_RECT       = {80,      120,    232,    160 };
+
+static const Rect SHOP_INFO_TEXT_RECT      = {72,      8,      232,    48  };
 
 static const Rect SINGLE_BLIND_SEL_REQ_SCORE_RECT = {80, 120,    104,     128  };
 
@@ -433,9 +575,218 @@ static const BG_POINT MAIN_MENU_ACE_T       = {88,      26};
 
 static uint rng_seed = 0;
 
+// -----------------------------------------------------------------------------
+// Run configuration (Deck / Stake / Endless)
+// Forward declaration for internal file-scope state used by early helpers.
+static int money;
+
+// -----------------------------------------------------------------------------
+enum DeckType
+{
+    DECK_RED = 0,
+    DECK_BLUE,
+    DECK_YELLOW,
+    DECK_GREEN,
+    DECK_BLACK,
+    DECK_TYPE_MAX
+};
+
+enum StakeType
+{
+    STAKE_WHITE = 0,
+    STAKE_RED,
+    STAKE_GREEN,
+    STAKE_BLACK,
+    STAKE_BLUE,
+    STAKE_PURPLE,
+    STAKE_ORANGE,
+    STAKE_GOLD,
+    STAKE_TYPE_MAX
+};
+
+// Selected settings on the main menu (persist across runs)
+static int selected_deck = DECK_RED;
+static int selected_stake = STAKE_WHITE;
+static bool endless_mode = false;
+
+static const char* deck_names[DECK_TYPE_MAX] = {"RED", "BLUE", "YELLOW", "GREEN", "BLACK"};
+static const char* stake_names[STAKE_TYPE_MAX] =
+    {"WHITE", "RED", "GREEN", "BLACK", "BLUE", "PURPLE", "ORANGE", "GOLD"};
+
+// 24.8 fixed multipliers (256 == 1.0). Applied on top of blind type multipliers.
+static const u16 stake_req_mult_lut[STAKE_TYPE_MAX] = {
+    256, // White  1.00x
+    282, // Red    1.10x
+    307, // Green  1.20x
+    346, // Black  1.35x
+    384, // Blue   1.50x
+    422, // Purple 1.65x
+    461, // Orange 1.80x
+    512  // Gold   2.00x
+};
+
+static inline u16 stake_get_req_mult(void)
+{
+    return stake_req_mult_lut[selected_stake];
+}
+
+static inline u32 u32_apply_fx_mult(u32 value, u16 mult_24_8)
+{
+    uint64_t out = ((uint64_t)value * (uint64_t)mult_24_8) >> 8;
+    if (out > 0xFFFFFFFFULL)
+        out = 0xFFFFFFFFULL;
+    return (u32)out;
+}
+
+static inline u32 game_blind_requirement(enum BlindType type, int ante_value)
+{
+    return u32_apply_fx_mult(blind_get_requirement(type, ante_value), stake_get_req_mult());
+}
+
+// -----------------------------------------------------------------------------
+// Skip Tags (lightweight implementation)
+// -----------------------------------------------------------------------------
+enum TagType
+{
+    TAG_NONE = 0,
+    TAG_ECONOMY,   // +$5 immediately
+    TAG_BUFFOON,   // +1 shop Joker slot this shop
+    TAG_DOUBLE,    // Double next cashout
+    TAG_HANDY,     // +1 hand next round
+    TAG_JUGGLE,    // +1 discard next round
+    TAG_INVESTMENT // +1 max interest (cap)
+    ,
+    TAG_TYPE_MAX
+};
+
+static const char* tag_names[TAG_TYPE_MAX] =
+    {"NONE", "ECONOMY", "BUFFOON", "DOUBLE", "HANDY", "JUGGLE", "INVEST"};
+
+#define MAX_TAGS_HELD 3
+static int tags_held[MAX_TAGS_HELD] = {TAG_NONE};
+static int tags_len = 0;
+
+// Tag-driven temporary/permanent modifiers
+static int shop_extra_slots = 0;
+static int free_rerolls = 0;
+static bool double_cashout_next = false;
+static int bonus_hands_next_round = 0;
+static int bonus_discards_next_round = 0;
+static int max_interest = MAX_INTEREST;
+
+// Shop slot count is dynamic per shop visit
+static int max_shop_jokers = MAX_SHOP_JOKERS;
+
+// Small HUD message for tags
+static const Rect TAG_MSG_RECT = {8, 136, 232, 152};
+
+static inline void tags_reset(void)
+{
+    tags_len = 0;
+    for (int i = 0; i < MAX_TAGS_HELD; i++)
+        tags_held[i] = TAG_NONE;
+}
+
+static inline void tags_push(int tag)
+{
+    if (tags_len >= MAX_TAGS_HELD)
+        return;
+    tags_held[tags_len++] = tag;
+}
+
+static inline int tag_roll_random(void)
+{
+    // Slightly weight economy/hand/discard early, spicy tags later.
+    int r = random() % 100;
+    if (r < 30)
+        return TAG_ECONOMY;
+    if (r < 50)
+        return TAG_HANDY;
+    if (r < 65)
+        return TAG_JUGGLE;
+    if (r < 80)
+        return TAG_BUFFOON;
+    if (r < 92)
+        return TAG_INVESTMENT;
+    return TAG_DOUBLE;
+}
+
+static void tag_print_last(void)
+{
+    if (tags_len <= 0)
+        return;
+
+    tte_erase_rect_wrapper(TAG_MSG_RECT);
+    tte_printf(
+        "#{P:%d,%d; cx:0x%X000}TAG: #{cx:0x%X000}%s",
+        TAG_MSG_RECT.left,
+        TAG_MSG_RECT.top,
+        TTE_WHITE_PB,
+        TTE_YELLOW_PB,
+        tag_names[tags_held[tags_len - 1]]
+    );
+}
+
+static void grant_skip_tag(void)
+{
+    tags_push(tag_roll_random());
+    tag_print_last();
+}
+
+static void apply_tags_on_shop_enter(void)
+{
+    // Reset per-shop modifiers
+    shop_extra_slots = 0;
+    free_rerolls = 0;
+
+    for (int i = 0; i < tags_len; i++)
+    {
+        switch (tags_held[i])
+        {
+            case TAG_ECONOMY:
+                money += 5;
+                break;
+            case TAG_BUFFOON:
+                shop_extra_slots += 1;
+                break;
+            case TAG_DOUBLE:
+                double_cashout_next = true;
+                break;
+            case TAG_HANDY:
+                bonus_hands_next_round += 1;
+                break;
+            case TAG_JUGGLE:
+                bonus_discards_next_round += 1;
+                break;
+            case TAG_INVESTMENT:
+                max_interest = min(max_interest + 1, 10);
+                break;
+            default:
+                break;
+        }
+    }
+
+    // A small bonus: on higher stakes, skipping is riskier, so grant one free reroll.
+    if (selected_stake >= STAKE_BLUE)
+        free_rerolls = 1;
+
+    // Apply immediate effects
+    display_money();
+
+    // Consume tags (their persistent effects were copied into the variables above)
+    tags_reset();
+
+    // Apply dynamic shop slot count for this shop visit
+    max_shop_jokers = MAX_SHOP_JOKERS + shop_extra_slots;
+    max_shop_jokers = min(max_shop_jokers, 4); // keep UI sane
+}
+
 typedef void (*SubStateActionFn)(void);
 
-static int timer = 0; // This might already exist in libtonc but idk so i'm just making my own
+static int timer = 0;
+static bool paused = false;
+static const Rect PAUSE_MSG_RECT = {88, 72, 168, 88};
+ // This might already exist in libtonc but idk so i'm just making my own
 // BY DEFAULT IS SET TO 1, but if changed to 2 or more, should speed up all (or most) of the game
 // aspects that should be sped up by speed, as in the original game.
 static int game_speed = 1;
@@ -726,6 +1077,59 @@ static inline Card* discard_pop()
     return discard_pile[discard_top--];
 }
 
+// -----------------------------------------------------------------------------
+// Run cleanup helpers
+// -----------------------------------------------------------------------------
+static void destroy_card_object_and_card(CardObject** card_object)
+{
+    if (card_object == NULL || *card_object == NULL)
+        return;
+
+    // CardObjects don't own their Card by default in this codebase, but for run reset we do.
+    card_destroy(&((*card_object)->card));
+    card_object_destroy(card_object);
+}
+
+static void clear_card_object_stack(CardObject* stack[], int* top)
+{
+    if (top == NULL)
+        return;
+
+    for (int i = 0; i <= *top; i++)
+    {
+        if (stack[i] != NULL)
+        {
+            destroy_card_object_and_card(&stack[i]);
+            stack[i] = NULL;
+        }
+    }
+    *top = -1;
+}
+
+static void clear_card_stack(Card* stack[], int* top)
+{
+    if (top == NULL)
+        return;
+
+    for (int i = 0; i <= *top; i++)
+    {
+        if (stack[i] != NULL)
+        {
+            card_destroy(&stack[i]);
+            stack[i] = NULL;
+        }
+    }
+    *top = -1;
+}
+
+static void run_reset_cards(void)
+{
+    clear_card_object_stack(hand, &hand_top);
+    clear_card_object_stack(played, &played_top);
+    clear_card_stack(deck, &deck_top);
+    clear_card_stack(discard_pile, &discard_top);
+}
+
 static inline void jokers_available_to_shop_init(void)
 {
     reset_shop_jokers();
@@ -743,16 +1147,38 @@ void game_init()
 
     jokers_available_to_shop_init();
 
+    // Reset run state (no deck/cards are created until the player presses Play)
+    run_reset_cards();
+    tags_reset();
+
+    shop_extra_slots = 0;
+    free_rerolls = 0;
+    double_cashout_next = false;
+    bonus_hands_next_round = 0;
+    bonus_discards_next_round = 0;
+    max_interest = MAX_INTEREST;
+    max_shop_jokers = MAX_SHOP_JOKERS;
+
+    max_hands = 4;
+    max_discards = 4;
     hands = max_hands;
     discards = max_discards;
+
     timer = TM_ZERO;
     current_blind = BLIND_TYPE_SMALL;
     blinds_states[0] = BLIND_STATE_CURRENT;
     blinds_states[1] = BLIND_STATE_UPCOMING;
     blinds_states[2] = BLIND_STATE_UPCOMING;
+    round = STARTING_ROUND;
     ante = STARTING_ANTE;
     money = STARTING_MONEY;
     score = STARTING_SCORE;
+    temp_score = 0;
+    chips = 0;
+    mult = 0;
+    retrigger = false;
+
+
 
     blind_select_tokens[BLIND_TYPE_SMALL] = blind_token_new(
         BLIND_TYPE_SMALL,
@@ -870,6 +1296,33 @@ static inline void jokers_update_loop(void)
 
 void game_update()
 {
+    // Toggle pause
+    if (key_hit(PAUSE_GAME))
+    {
+        paused = !paused;
+        if (paused)
+        {
+            // Simple pause overlay
+            tte_erase_rect_wrapper(PAUSE_MSG_RECT);
+            tte_printf(
+                "#{P:%d,%d; cx:0x%X000}PAUSED",
+                PAUSE_MSG_RECT.left,
+                PAUSE_MSG_RECT.top,
+                TTE_WHITE_PB
+            );
+        }
+        else
+        {
+            tte_erase_rect_wrapper(PAUSE_MSG_RECT);
+        }
+    }
+
+    if (paused)
+    {
+        // Freeze all game logic while paused (timer stays constant too)
+        return;
+    }
+
     timer++;
 
     jokers_update_loop();
@@ -1131,13 +1584,25 @@ void display_mult(void)
 
 static inline void display_ante(int value)
 {
-    tte_printf(
-        "#{P:%d,%d; cx:0xC000}%d#{cx:0xF000}/%d",
-        ANTE_TEXT_RECT.left,
-        ANTE_TEXT_RECT.top,
-        value,
-        MAX_ANTE
-    );
+    if (endless_mode)
+    {
+        tte_printf(
+            "#{P:%d,%d; cx:0xC000}%d#{cx:0xF000}/END",
+            ANTE_TEXT_RECT.left,
+            ANTE_TEXT_RECT.top,
+            value
+        );
+    }
+    else
+    {
+        tte_printf(
+            "#{P:%d,%d; cx:0xC000}%d#{cx:0xF000}/%d",
+            ANTE_TEXT_RECT.left,
+            ANTE_TEXT_RECT.top,
+            value,
+            MAX_ANTE
+        );
+    }
 }
 
 // idx_a and idx_b are assumed to be valid indexes within the hand array
@@ -1429,6 +1894,12 @@ static void change_background(enum BackgroundId id)
     if (background == id)
     {
         return;
+    }
+    // Clear Peek Deck overlay when leaving card play/select backgrounds.
+    if (id != BG_CARD_SELECTING && id != BG_CARD_PLAYING)
+    {
+        Rect peek_rect = {8, 120, 232, 136};
+        tte_erase_rect_wrapper(peek_rect);
     }
     else if (id == BG_CARD_SELECTING)
     {
@@ -1788,7 +2259,7 @@ static void display_score(u32 value)
 static void check_flaming_score(void)
 {
     u32 curr_score = u32_protected_mult(chips, mult);
-    u32 required_score = blind_get_requirement(current_blind, ante);
+    u32 required_score = game_blind_requirement(current_blind, ante);
     if (curr_score >= required_score && !score_flames_active)
     {
         // start flaming score
@@ -1941,7 +2412,7 @@ static void game_round_on_init()
     }
 
     Rect blind_req_text_rect = BLIND_REQ_TEXT_RECT;
-    u32 blind_requirement = blind_get_requirement(current_blind, ante);
+    u32 blind_requirement = game_blind_requirement(current_blind, ante);
 
     char blind_req_str_buff[UINT_MAX_DIGITS + 1];
 
@@ -1991,6 +2462,43 @@ static void game_main_menu_on_init()
     main_menu_ace->sprite_object->ty = int2fx(MAIN_MENU_ACE_T.y);
     main_menu_ace->sprite_object->y = main_menu_ace->sprite_object->ty;
     main_menu_ace->sprite_object->tscale = float2fx(0.8f);
+
+    // Print run config
+    Rect cfg = {16, 104, 224, 152};
+    tte_erase_rect_wrapper(cfg);
+    tte_printf(
+        "#{P:%d,%d; cx:0x%X000}DECK: #{cx:0x%X000}%s",
+        16,
+        104,
+        TTE_WHITE_PB,
+        TTE_YELLOW_PB,
+        deck_names[selected_deck]
+    );
+    tte_printf(
+        "#{P:%d,%d; cx:0x%X000}STAKE: #{cx:0x%X000}%s",
+        16,
+        116,
+        TTE_WHITE_PB,
+        TTE_YELLOW_PB,
+        stake_names[selected_stake]
+    );
+    tte_printf(
+        "#{P:%d,%d; cx:0x%X000}ENDLESS: #{cx:0x%X000}%s",
+        16,
+        128,
+        TTE_WHITE_PB,
+        TTE_YELLOW_PB,
+        endless_mode ? \"ON\" : \"OFF\"
+    );
+    tte_printf(
+        "#{P:%d,%d; cx:0x%X000}L/R Deck  U/D Stake  SEL Endless",
+        16,
+        144,
+        TTE_BLUE_PB
+    );
+
+    paused = false;
+    tte_erase_rect_wrapper(PAUSE_MSG_RECT);
 }
 
 static void game_over_init(void)
@@ -2359,17 +2867,18 @@ static inline void game_playing_handle_round_over(void)
 {
     enum GameState next_state = GAME_STATE_ROUND_END;
 
-    if (score >= blind_get_requirement(current_blind, ante))
+    if (score >= game_blind_requirement(current_blind, ante))
     {
         if (current_blind == BLIND_TYPE_BOSS)
         {
-            if (ante < MAX_ANTE)
+            // Boss blind advances the ante. If Endless is disabled, the run ends after Ante 8.
+            if (!endless_mode && ante >= MAX_ANTE)
             {
-                display_ante(++ante);
+                next_state = GAME_STATE_WIN;
             }
             else
             {
-                next_state = GAME_STATE_WIN;
+                display_ante(++ante);
             }
         }
     }
@@ -2684,7 +3193,7 @@ static bool check_and_score_joker_for_event(
 
 static inline bool game_round_is_over(void)
 {
-    return hands == 0 || score >= blind_get_requirement(current_blind, ante);
+    return hands == 0 || score >= game_blind_requirement(current_blind, ante);
 }
 
 // Basically a copy of HAND_DISCARD
@@ -3482,6 +3991,92 @@ static inline void game_playing_process_flaming_score(void)
     }
 }
 
+
+// -----------------------------------------------------------------------------
+// Peek Deck (L): lightweight text overlay of upcoming cards
+// -----------------------------------------------------------------------------
+#define PEEK_DECK_COUNT 3
+static bool peek_deck_visible = false;
+static const Rect PEEK_DECK_RECT = {8, 120, 232, 136};
+
+static inline char rank_to_char(u8 rank)
+{
+    if (rank <= NINE)
+        return (char)('2' + rank);
+    switch (rank)
+    {
+        case TEN:
+            return 'T';
+        case JACK:
+            return 'J';
+        case QUEEN:
+            return 'Q';
+        case KING:
+            return 'K';
+        case ACE:
+            return 'A';
+        default:
+            return '?';
+    }
+}
+
+static inline char suit_to_char(u8 suit)
+{
+    switch (suit)
+    {
+        case DIAMONDS:
+            return 'D';
+        case CLUBS:
+            return 'C';
+        case HEARTS:
+            return 'H';
+        case SPADES:
+            return 'S';
+        default:
+            return '?';
+    }
+}
+
+static void peek_deck_update_overlay(void)
+{
+    bool show = key_is_down(PEEK_DECK) && game_state == GAME_STATE_PLAYING && hand_state == HAND_SELECT;
+
+    if (show)
+    {
+        char buf[64];
+        int off = 0;
+        off += snprintf(buf + off, sizeof(buf) - (size_t)off, "NEXT: ");
+
+        for (int i = 0; i < PEEK_DECK_COUNT && deck_top - i >= 0; i++)
+        {
+            Card* c = deck[deck_top - i];
+            if (c == NULL)
+                break;
+            if (off + 4 >= (int)sizeof(buf))
+                break;
+            buf[off++] = rank_to_char(c->rank);
+            buf[off++] = suit_to_char(c->suit);
+            buf[off++] = ' ';
+        }
+        buf[off] = '\0';
+
+        tte_erase_rect_wrapper(PEEK_DECK_RECT);
+        tte_printf(
+            "#{P:%d,%d; cx:0x%X000}%s",
+            PEEK_DECK_RECT.left,
+            PEEK_DECK_RECT.top,
+            TTE_WHITE_PB,
+            buf
+        );
+        peek_deck_visible = true;
+    }
+    else if (peek_deck_visible)
+    {
+        tte_erase_rect_wrapper(PEEK_DECK_RECT);
+        peek_deck_visible = false;
+    }
+}
+
 static void game_playing_on_update(void)
 {
     // Background logic (thissss might be moved to the card'ssss logic later. I'm a sssssnake)
@@ -3493,6 +4088,8 @@ static void game_playing_on_update(void)
     {
         change_background(BG_CARD_PLAYING);
     }
+
+    peek_deck_update_overlay();
 
     game_playing_process_input_and_state();
 
@@ -3516,8 +4113,8 @@ static void game_playing_on_update(void)
 static int calculate_interest_reward(void)
 {
     int reward = (money / 5) * INTEREST_PER_5;
-    if (reward > MAX_INTEREST)
-        reward = MAX_INTEREST;
+    if (reward > max_interest)
+        reward = max_interest;
     return reward;
 }
 
@@ -3591,7 +4188,7 @@ static void game_round_end_display_finished_blind()
         current_ante--;
 
     Rect blind_req_rect = ROUND_END_BLIND_REQ_RECT;
-    u32 blind_req = blind_get_requirement(current_blind, current_ante);
+    u32 blind_req = game_blind_requirement(current_blind, current_ante);
 
     /* Not bothering to truncate here because there are 8 tiles
      * and the blind requirement will not increase past ante 8
@@ -3828,14 +4425,32 @@ static void game_round_end_display_rewards()
     }
 }
 
+static inline int get_cashout_amount_preview(void)
+{
+    int cashout_amount = hands + blind_get_reward(current_blind) + calculate_interest_reward();
+    if (double_cashout_next)
+        cashout_amount *= 2;
+    return cashout_amount;
+}
+
 static inline void game_round_end_cashout(void)
 {
     // Reward the player
-    money += hands + blind_get_reward(current_blind) + calculate_interest_reward();
+    int cashout_amount = get_cashout_amount_preview();
+    money += cashout_amount;
+
+    // Consume one-shot modifiers
+    if (double_cashout_next)
+        double_cashout_next = false;
+
     display_money();
 
-    hands = max_hands;          // Reset the hands to the maximum
-    discards = max_discards;    // Reset the discards to the maximum
+    // Reset the hands/discards to the maximum (+ any next-round bonuses)
+    hands = max_hands + bonus_hands_next_round;
+    discards = max_discards + bonus_discards_next_round;
+    bonus_hands_next_round = 0;
+    bonus_discards_next_round = 0;
+
     display_hands(hands);       // Set the hands display
     display_discards(discards); // Set the discards display
 
@@ -3850,7 +4465,7 @@ static void game_round_end_display_cashout()
         // Put the "cash out" button onto the round end panel
         main_bg_se_copy_expand_3x3_rect(CASHOUT_DEST_RECT, CASHOUT_SRC_3X3_RECT_POS);
 
-        int cashout_amount = hands + blind_get_reward(current_blind) + calculate_interest_reward();
+        int cashout_amount = get_cashout_amount_preview();
 
         bool omit_space = cashout_amount >= 10;
         tte_printf(
@@ -3886,212 +4501,6 @@ static void game_round_end_dismiss_round_end_panel()
     {
         timer = TM_ZERO;
         state_info[game_state].substate = ROUND_END_EXIT;
-    }
-}
-
-// -------------------------------
-// Shop info panel text utilities
-// -------------------------------
-
-static inline int tte_chars_that_fit(const Rect* r)
-{
-    // Use the same approach as update_text_rect_to_center_str(): integer division by char width.
-    return rect_width(r) / TTE_CHAR_SIZE;
-}
-
-static void tte_print_wrapped(
-    int x,
-    int y,
-    int max_cols,
-    int max_lines,
-    int palette_bank,
-    const char* text
-)
-{
-    if (text == NULL || max_cols <= 0 || max_lines <= 0)
-        return;
-
-    char line[64];
-    int line_len = 0;
-    int lines_printed = 0;
-
-    const char* p = text;
-
-    // Helper to flush current line buffer.
-#define FLUSH_LINE()                                                                           \
-    do                                                                                         \
-    {                                                                                          \
-        if (lines_printed >= max_lines)                                                        \
-            goto done;                                                                         \
-        line[line_len] = '\0';                                                                 \
-        tte_printf(                                                                            \
-            "#{P:%d,%d; cx:0x%X000}%s",                                                       \
-            x,                                                                                 \
-            y + lines_printed * TTE_CHAR_SIZE,                                                 \
-            palette_bank,                                                                      \
-            line                                                                               \
-        );                                                                                     \
-        lines_printed++;                                                                       \
-        line_len = 0;                                                                          \
-    } while (0)
-
-    while (*p != '\0' && lines_printed < max_lines)
-    {
-        // Explicit newline forces a wrap.
-        if (*p == '\n')
-        {
-            FLUSH_LINE();
-            p++;
-            continue;
-        }
-
-        // Skip leading spaces.
-        while (*p == ' ')
-            p++;
-        if (*p == '\0')
-            break;
-
-        // Read next word.
-        const char* w = p;
-        int wlen = 0;
-        while (w[wlen] != '\0' && w[wlen] != ' ' && w[wlen] != '\n')
-            wlen++;
-
-        // If word itself is longer than a line, hard-split it.
-        int consumed = 0;
-        while (consumed < wlen && lines_printed < max_lines)
-        {
-            int seg_len = min(max_cols, wlen - consumed);
-
-            // If we already have content on the line, and it won't fit with a space, flush.
-            if (line_len > 0 && (line_len + 1 + seg_len) > max_cols)
-            {
-                FLUSH_LINE();
-            }
-
-            // Add space if needed.
-            if (line_len > 0)
-                line[line_len++] = ' ';
-
-            for (int i = 0; i < seg_len && line_len < (int)sizeof(line) - 1; i++)
-                line[line_len++] = w[consumed + i];
-
-            consumed += seg_len;
-
-            // If we split a long word, flush immediately so the next segment starts on new line.
-            if (consumed < wlen)
-            {
-                FLUSH_LINE();
-            }
-        }
-
-        p += wlen;
-    }
-
-    if (line_len > 0 && lines_printed < max_lines)
-    {
-        FLUSH_LINE();
-    }
-
-done:
-#undef FLUSH_LINE
-}
-
-static inline void shop_desc_clear(void)
-{
-    tte_erase_rect_wrapper(SHOP_DESC_TEXT_RECT);
-}
-
-static void shop_desc_set(const char* title, const char* body)
-{
-    shop_desc_clear();
-
-    if (title == NULL)
-        title = "";
-    if (body == NULL)
-        body = "";
-
-    // Title (yellow) on first line
-    tte_printf(
-        "#{P:%d,%d; cx:0x%X000}%s",
-        SHOP_DESC_TEXT_RECT.left,
-        SHOP_DESC_TEXT_RECT.top,
-        TTE_YELLOW_PB,
-        title
-    );
-
-    // Body (white), wrapped below
-    Rect body_rect = SHOP_DESC_TEXT_RECT;
-    body_rect.top += TTE_CHAR_SIZE;
-
-    int max_cols = tte_chars_that_fit(&body_rect);
-    int max_lines = rect_height(&body_rect) / TTE_CHAR_SIZE;
-
-    tte_print_wrapped(body_rect.left, body_rect.top, max_cols, max_lines, TTE_WHITE_PB, body);
-}
-
-static void shop_update_description_for_selection(const Selection* selection)
-{
-    if (selection == NULL)
-    {
-        shop_desc_clear();
-        return;
-    }
-
-    switch (selection->y)
-    {
-        // Owned Jokers row
-        case 0: {
-            JokerObject* joker_object =
-                (JokerObject*)list_get_at_idx(&_owned_jokers_list, selection->x);
-            if (joker_object == NULL || joker_object->joker == NULL)
-            {
-                shop_desc_clear();
-                return;
-            }
-
-            shop_desc_set(
-                joker_get_display_name(joker_object->joker->id),
-                joker_get_description(joker_object->joker->id)
-            );
-            return;
-        }
-
-        // Shop row: Next Round button (x=0) + shop Jokers (x>=1)
-        case 1: {
-            if (selection->x == NEXT_ROUND_BTN_SEL_X)
-            {
-                shop_desc_set("NEXT ROUND", "Leave the shop and pick the next blind.");
-                return;
-            }
-
-            int shop_joker_idx = selection->x - 1;
-            JokerObject* joker_object = (JokerObject*)list_get_at_idx(&_shop_jokers_list, shop_joker_idx);
-            if (joker_object == NULL || joker_object->joker == NULL)
-            {
-                shop_desc_clear();
-                return;
-            }
-
-            shop_desc_set(
-                joker_get_display_name(joker_object->joker->id),
-                joker_get_description(joker_object->joker->id)
-            );
-            return;
-        }
-
-        // Reroll row
-        case 2: {
-            static char reroll_desc[64];
-            // Keep this short to fit the 5-line panel.
-            snprintf(reroll_desc, sizeof(reroll_desc), "Pay $%d to refresh shop. Cost +1 each time.", reroll_cost);
-            shop_desc_set("REROLL", reroll_desc);
-            return;
-        }
-
-        default:
-            shop_desc_clear();
-            return;
     }
 }
 
@@ -4187,7 +4596,7 @@ static void game_shop_create_items(void)
     list_clear(&_shop_jokers_list);
     _shop_jokers_list = list_create();
 
-    for (int i = 0; i < MAX_SHOP_JOKERS; i++)
+    for (int i = 0; i < max_shop_jokers; i++)
     {
         int joker_id = 0;
 #ifdef TEST_JOKER_ID0 // Allow defining an ID for a joker to always appear in shop and be tested
@@ -4240,6 +4649,7 @@ static void game_shop_intro()
 
     if (timer == TM_CREATE_SHOP_ITEMS_WAIT)
     {
+        apply_tags_on_shop_enter();
         game_shop_create_items();
     }
 
@@ -4326,11 +4736,11 @@ static bool jokers_sel_row_on_selection_changed(
             (unsigned int)new_selection->x
         );
     }
-
-    if (new_selection->y == row_idx)
+    if (game_state == GAME_STATE_SHOP && new_selection->y == row_idx)
     {
-        shop_update_description_for_selection(new_selection);
+        shop_update_info_panel(new_selection);
     }
+
 
     return true;
 }
@@ -4500,11 +4910,11 @@ static bool shop_top_row_on_selection_changed(
             sprite_object_set_focus(joker_object->sprite_object, true);
         }
     }
-
     if (new_selection->y == row_idx)
     {
-        shop_update_description_for_selection(new_selection);
+        shop_update_info_panel(new_selection);
     }
+
 
     return true;
 }
@@ -4530,19 +4940,26 @@ static bool shop_reroll_row_on_selection_changed(
     {
         memset16(&pal_bg_mem[REROLL_BTN_SELECTED_BORDER_PID], BTN_HIGHLIGHT_COLOR, 1);
     }
-
     if (new_selection->y == row_idx)
     {
-        shop_update_description_for_selection(new_selection);
+        shop_update_info_panel(new_selection);
     }
+
 
     return true;
 }
 
 static inline void game_shop_reroll(int* reroll_cost)
 {
-    money -= *reroll_cost;
-    display_money(); // Update the money display
+    if (free_rerolls > 0)
+    {
+        free_rerolls--;
+    }
+    else
+    {
+        money -= *reroll_cost;
+        display_money(); // Update the money display
+    }
 
     ListItr itr = list_itr_create(&_shop_jokers_list);
     JokerObject* joker_object;
@@ -4576,16 +4993,25 @@ static inline void game_shop_reroll(int* reroll_cost)
     }
 
     (*reroll_cost)++;
-    tte_printf(
-        "#{P:%d,%d; cx:0x%X000}$%d",
-        SHOP_REROLL_RECT.left,
-        SHOP_REROLL_RECT.top,
-        TTE_WHITE_PB,
-        *reroll_cost
-    );
-
-    // Keep the info panel in sync (cost changes without a selection change).
-    shop_update_description_for_selection(&shop_selection_grid.selection);
+    if (free_rerolls > 0)
+    {
+        tte_printf(
+            "#{P:%d,%d; cx:0x%X000}FREE",
+            SHOP_REROLL_RECT.left,
+            SHOP_REROLL_RECT.top,
+            TTE_WHITE_PB
+        );
+    }
+    else
+    {
+        tte_printf(
+            "#{P:%d,%d; cx:0x%X000}$%d",
+            SHOP_REROLL_RECT.left,
+            SHOP_REROLL_RECT.top,
+            TTE_WHITE_PB,
+            *reroll_cost
+        );
+    }
 }
 
 static void shop_reroll_row_on_key_transit(SelectionGrid* selection_grid, Selection* selection)
@@ -4595,7 +5021,7 @@ static void shop_reroll_row_on_key_transit(SelectionGrid* selection_grid, Select
         return;
     }
 
-    if (money >= reroll_cost)
+    if (free_rerolls > 0 || money >= reroll_cost)
     {
         // TODO: Add money sound effect
         play_sfx(SFX_BUTTON, MM_BASE_PITCH_RATE, BUTTON_SFX_VOLUME);
@@ -4612,19 +5038,32 @@ static void game_shop_process_user_input()
         // The selection grid is initialized outside of bounds and moved
         // to trigger the selection change so the initial selection is visible
         shop_selection_grid.selection = SHOP_INIT_SEL;
-        // First land on NEXT ROUND (x=0), then (if available) advance to the first shop Joker.
-        selection_grid_move_selection_horz(&shop_selection_grid, 1);
-        if (list_get_len(&_shop_jokers_list) > 0)
+        // Default to the first purchasable Joker (x=1) so the info panel
+        // immediately shows a Joker description on entering the shop.
+        int init_moves = (list_get_len(&_shop_jokers_list) > 0) ? 2 : 1;
+        for (int i = 0; i < init_moves; i++)
         {
             selection_grid_move_selection_horz(&shop_selection_grid, 1);
         }
-        tte_printf(
-            "#{P:%d,%d; cx:0x%X000}$%d",
-            SHOP_REROLL_RECT.left,
-            SHOP_REROLL_RECT.top,
-            TTE_WHITE_PB,
-            reroll_cost
-        );
+        if (free_rerolls > 0)
+        {
+            tte_printf(
+                "#{P:%d,%d; cx:0x%X000}FREE",
+                SHOP_REROLL_RECT.left,
+                SHOP_REROLL_RECT.top,
+                TTE_WHITE_PB
+            );
+        }
+        else
+        {
+            tte_printf(
+                "#{P:%d,%d; cx:0x%X000}$%d",
+                SHOP_REROLL_RECT.left,
+                SHOP_REROLL_RECT.top,
+                TTE_WHITE_PB,
+                reroll_cost
+            );
+        }
     }
 
     // Shop input logic
@@ -4644,7 +5083,7 @@ static void game_shop_outro()
     if (timer == 1)
     {
         tte_erase_rect_wrapper(SHOP_PRICES_TEXT_RECT); // Erase the shop prices text
-        shop_desc_clear();
+        tte_erase_rect_wrapper(SHOP_INFO_TEXT_RECT);   // Erase the shop info text
 
         ListItr itr = list_itr_create(&_shop_jokers_list);
         JokerObject* joker_object;
@@ -4723,7 +5162,7 @@ static void game_shop_on_update()
 
     if (state_info[game_state].substate == GAME_SHOP_MAX)
     {
-        game_change_state(GAME_STATE_BLIND_SELECT);
+        game_change_state(GAME_STATE_MAIN_MENU);
         return;
     }
 
@@ -4748,8 +5187,6 @@ static void game_shop_on_exit()
     }
 
     list_clear(&_shop_jokers_list);
-
-    shop_desc_clear();
 
     increment_blind(BLIND_STATE_DEFEATED); // TODO: Move to game_round_end()?
 }
@@ -4818,7 +5255,7 @@ static inline void game_blind_select_print_blind_req(enum BlindType blind)
 {
     Rect blind_req_score_rect = game_blind_select_get_req_score_rect(blind);
 
-    u32 blind_req = blind_get_requirement(blind, ante);
+    u32 blind_req = game_blind_requirement(blind, ante);
 
     char blind_req_str_buff[UINT_MAX_DIGITS + 1];
     truncate_uint_to_suffixed_str(
@@ -4922,6 +5359,7 @@ static void game_blind_select_handle_input()
         {
             play_sfx(SFX_BUTTON, MM_BASE_PITCH_RATE, BUTTON_SFX_VOLUME);
             increment_blind(BLIND_STATE_SKIPPED);
+            grant_skip_tag();
 
             selection_y = 0; // Reset selection to first option
 
@@ -5050,8 +5488,71 @@ static inline void game_start(void)
     card_destroy(&main_menu_ace->card);
     card_object_destroy(&main_menu_ace);
 
+
+    // Reset any lingering run state (useful when restarting after Game Over)
+    run_reset_cards();
+    tags_reset();
+    reset_shop_jokers();
+    shop_extra_slots = 0;
+    free_rerolls = 0;
+    double_cashout_next = false;
+    bonus_hands_next_round = 0;
+    bonus_discards_next_round = 0;
+    max_shop_jokers = MAX_SHOP_JOKERS;
+
+    // Stake modifies interest cap and starting cash slightly.
+    max_interest = max(1, MAX_INTEREST - (selected_stake / 2));
+
+    // Deck defaults
+    max_hands = 4;
+    max_discards = 4;
+    int starting_money = STARTING_MONEY;
+
+    switch (selected_deck)
+    {
+        case DECK_BLUE:
+            max_hands += 1;
+            break;
+        case DECK_YELLOW:
+            starting_money += 10;
+            break;
+        case DECK_GREEN:
+            max_discards += 1;
+            break;
+        case DECK_BLACK:
+            max_hands = max(1, max_hands - 1);
+            starting_money += 6;
+            break;
+        case DECK_RED:
+        default:
+            break;
+    }
+
+    // Higher stakes start with less money (difficulty)
+    starting_money = max(0, starting_money - selected_stake);
+    money = starting_money;
+
+    round = STARTING_ROUND;
+    ante = STARTING_ANTE;
+    score = STARTING_SCORE;
+    temp_score = 0;
+    score_flames_active = false;
+    lerped_score = 0;
+    lerped_temp_score = 0;
+
+    chips = 0;
+    mult = 0;
+    retrigger = false;
+
     hands = max_hands;
     discards = max_discards;
+
+    current_blind = BLIND_TYPE_SMALL;
+    blinds_states[0] = BLIND_STATE_CURRENT;
+    blinds_states[1] = BLIND_STATE_UPCOMING;
+    blinds_states[2] = BLIND_STATE_UPCOMING;
+
+    reroll_cost = REROLL_BASE_COST;
 
     // Fill the deck with all the cards. Later on this can be replaced with a more dynamic system
     // that allows for different decks and card types.
@@ -5088,15 +5589,7 @@ static inline void game_start(void)
 
     display_money(); // Set the money display
 
-    tte_printf(
-        "#{P:%d,%d; cx:0x%X000}%d#{cx:0x%X000}/%d",
-        ANTE_TEXT_RECT.left,
-        ANTE_TEXT_RECT.top,
-        TTE_YELLOW_PB,
-        ante,
-        TTE_WHITE_PB,
-        MAX_ANTE
-    ); // Ante
+    display_ante(ante);
 
     game_change_state(GAME_STATE_BLIND_SELECT);
 }
@@ -5117,20 +5610,75 @@ static void game_main_menu_on_update()
         rng_seed *= 2;
     }
 
+    bool cfg_changed = false;
+
+    // Deck select: Left/Right
     if (key_hit(KEY_LEFT))
     {
-        if (selection_x > 0)
-        {
-            selection_x--;
-        }
+        selected_deck = (selected_deck + DECK_TYPE_MAX - 1) % DECK_TYPE_MAX;
+        cfg_changed = true;
     }
     else if (key_hit(KEY_RIGHT))
     {
-        if (selection_x < MAIN_MENU_IMPLEMENTED_BUTTONS - 1)
-        {
-            selection_x++;
-        }
+        selected_deck = (selected_deck + 1) % DECK_TYPE_MAX;
+        cfg_changed = true;
     }
+
+    // Stake select: Up/Down
+    if (key_hit(KEY_UP))
+    {
+        selected_stake = (selected_stake + 1) % STAKE_TYPE_MAX;
+        cfg_changed = true;
+    }
+    else if (key_hit(KEY_DOWN))
+    {
+        selected_stake = (selected_stake + STAKE_TYPE_MAX - 1) % STAKE_TYPE_MAX;
+        cfg_changed = true;
+    }
+
+    // Endless toggle: SELECT
+    if (key_hit(KEY_SELECT))
+    {
+        endless_mode = !endless_mode;
+        cfg_changed = true;
+    }
+
+    if (cfg_changed)
+    {
+        Rect cfg = {16, 104, 224, 152};
+        tte_erase_rect_wrapper(cfg);
+        tte_printf(
+            "#{P:%d,%d; cx:0x%X000}DECK: #{cx:0x%X000}%s",
+            16,
+            104,
+            TTE_WHITE_PB,
+            TTE_YELLOW_PB,
+            deck_names[selected_deck]
+        );
+        tte_printf(
+            "#{P:%d,%d; cx:0x%X000}STAKE: #{cx:0x%X000}%s",
+            16,
+            116,
+            TTE_WHITE_PB,
+            TTE_YELLOW_PB,
+            stake_names[selected_stake]
+        );
+        tte_printf(
+            "#{P:%d,%d; cx:0x%X000}ENDLESS: #{cx:0x%X000}%s",
+            16,
+            128,
+            TTE_WHITE_PB,
+            TTE_YELLOW_PB,
+            endless_mode ? "ON" : "OFF"
+        );
+        tte_printf(
+            "#{P:%d,%d; cx:0x%X000}L/R Deck  U/D Stake  SEL Endless",
+            16,
+            144,
+            TTE_BLUE_PB
+        );
+    }
+
 
     if (selection_x == MAIN_MENU_PLAY_BTN_IDX)
     {
@@ -5223,15 +5771,7 @@ static void game_over_on_exit()
     display_discards(discards);
     display_money();
     // Ante
-    tte_printf(
-        "#{P:%d,%d; cx:0x%X000}%d#{cx:0x%X000}/%d",
-        ANTE_TEXT_RECT.left,
-        ANTE_TEXT_RECT.top,
-        TTE_YELLOW_PB,
-        ante,
-        TTE_WHITE_PB,
-        MAX_ANTE
-    );
+    display_ante(ante);
 
     affine_background_load_palette(affine_background_gfxPal);
 }
