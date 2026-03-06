@@ -316,6 +316,11 @@ static bool jokers_sel_row_on_selection_changed(
 // Shop info panel (text)
 // --------------------------
 
+static const Rect SHOP_INFO_TEXT_RECT;
+static int reroll_cost;
+static List _owned_jokers_list;
+static List _shop_jokers_list;
+
 static void shop_info_clear(void)
 {
     tte_erase_rect_wrapper(SHOP_INFO_TEXT_RECT);
@@ -354,7 +359,7 @@ static void shop_info_print_wrapped(const Rect* rect, int color_pb, const char* 
         int len = 0;
         int last_space = -1;
 
-        while (p[len] && p[len] != '\n' and len < max_chars)
+        while (p[len] && p[len] != '\n' && len < max_chars)
         {
             if (p[len] == ' ')
                 last_space = len;
@@ -366,7 +371,7 @@ static void shop_info_print_wrapped(const Rect* rect, int color_pb, const char* 
         {
             advance = len + 1;
         }
-        else if (len == max_chars and last_space > 0)
+        else if (len == max_chars && last_space > 0)
         {
             len = last_space;
             advance = last_space + 1;
@@ -2488,7 +2493,7 @@ static void game_main_menu_on_init()
         128,
         TTE_WHITE_PB,
         TTE_YELLOW_PB,
-        endless_mode ? \"ON\" : \"OFF\"
+        endless_mode ? "ON" : "OFF"
     );
     tte_printf(
         "#{P:%d,%d; cx:0x%X000}L/R Deck  U/D Stake  SEL Endless",
