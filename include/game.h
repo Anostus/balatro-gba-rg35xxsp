@@ -17,9 +17,9 @@
 // Input bindings
 #define SELECT_CARD    KEY_A
 #define DESELECT_CARDS KEY_B
-#define PEEK_DECK      KEY_L // Not implemented
+#define PEEK_DECK      KEY_SELECT
 #define SORT_HAND      KEY_R
-#define PAUSE_GAME     KEY_START // Not implemented
+#define PAUSE_GAME     KEY_START
 #define SELL_KEY       KEY_L
 
 // Matching the position of the on-screen buttons
