@@ -7,6 +7,7 @@
 #include "util.h"
 
 #include <tonc.h>
+#include <stdint.h>
 
 // Maps the ante number to the base blind requirement for that ante.
 // The game starts at ante 1 which is at index 1 for base requirement 300.
@@ -73,11 +74,43 @@ void blind_init()
 
 u32 blind_get_requirement(enum BlindType type, int ante)
 {
-    // Ensure ante is within valid range
-    if (ante < 0 || ante > MAX_ANTE)
+    // Allow Endless Mode by supporting ante values beyond MAX_ANTE.
+    // For antes above MAX_ANTE, continue scaling requirements with a gentle geometric ramp.
+    if (ante < 0)
         ante = 0;
 
-    return fx2int(_blind_type_map[type].score_req_multipler * ante_lut[ante]);
+    uint64_t base_req = 0;
+
+    if (ante <= MAX_ANTE)
+    {
+        base_req = (uint64_t)ante_lut[ante];
+    }
+    else
+    {
+        base_req = (uint64_t)ante_lut[MAX_ANTE];
+
+        // After the final LUT entry, grow ~1.5x per ante.
+        // This is intentionally simple and capped to avoid overflow on GBA.
+        int extra = ante - MAX_ANTE;
+        for (int i = 0; i < extra; i++)
+        {
+            base_req = (base_req * 3ULL) / 2ULL;
+            if (base_req > 0xFFFFFFFFULL)
+            {
+                base_req = 0xFFFFFFFFULL;
+                break;
+            }
+        }
+    }
+
+    // score_req_multipler is 24.8 fixed, so multiply then shift by 8.
+    uint64_t req64 =
+        ((int64_t)_blind_type_map[type].score_req_multipler * (int64_t)base_req) >> 8;
+
+    if (req64 > 0xFFFFFFFFULL)
+        req64 = 0xFFFFFFFFULL;
+
+    return (u32)req64;
 }
 
 int blind_get_reward(enum BlindType type)
