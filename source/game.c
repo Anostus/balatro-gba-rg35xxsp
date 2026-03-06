@@ -316,10 +316,11 @@ static bool jokers_sel_row_on_selection_changed(
 // Shop info panel (text)
 // --------------------------
 
+// Forward declarations for file-scope objects referenced by the early shop-info helpers.
 static const Rect SHOP_INFO_TEXT_RECT;
-static int reroll_cost;
 static List _owned_jokers_list;
 static List _shop_jokers_list;
+static int reroll_cost;
 
 static void shop_info_clear(void)
 {
